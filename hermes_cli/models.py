@@ -234,10 +234,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
  "XiaomiMiMo/MiMo-V2-Flash",
  "moonshotai/Kimi-K2-Thinking",
  ],
- "nvidia": [
- "nvidia/nemotron-3-super-120b-a12b",
- "nvidia/nemotron-3-nano-30b-a3b",
- ],
+    "nvidia": [],
 }
 
 _PROVIDER_LABELS = {
