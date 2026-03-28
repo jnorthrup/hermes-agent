@@ -608,6 +608,21 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "NVIDIA_API_KEY": {
+        "description": "NVIDIA NIM API key",
+        "prompt": "NVIDIA API key",
+        "url": "https://build.nvidia.com/settings/api-keys",
+        "password": True,
+        "category": "provider",
+    },
+    "NVIDIA_BASE_URL": {
+        "description": "NVIDIA NIM base URL override",
+        "prompt": "NVIDIA base URL (leave empty for default)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
 
     # ── Tool API keys ──
     "PARALLEL_API_KEY": {

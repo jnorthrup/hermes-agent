@@ -795,6 +795,7 @@ def cmd_model(args):
         "ai-gateway": "AI Gateway",
         "kilocode": "Kilo Code",
         "alibaba": "Alibaba Cloud (DashScope)",
+        "nvidia": "NVIDIA NIM",
         "huggingface": "Hugging Face",
         "custom": "Custom endpoint",
     }
@@ -822,6 +823,7 @@ def cmd_model(args):
         ("opencode-go", "OpenCode Go (open models, $10/month subscription)"),
         ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("alibaba", "Alibaba Cloud / DashScope Coding (Qwen + multi-provider)"),
+        ("nvidia", "NVIDIA NIM (integrate.api.nvidia.com/v1)"),
         ("huggingface", "Hugging Face Inference Providers (20+ open models)"),
     ]
 
@@ -895,7 +897,7 @@ def cmd_model(args):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "huggingface"):
+    elif selected_provider in ("zai", "minimax", "minimax-cn", "kilocode", "opencode-zen", "opencode-go", "ai-gateway", "alibaba", "nvidia", "huggingface"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 

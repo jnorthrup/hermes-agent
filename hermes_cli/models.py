@@ -235,8 +235,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
  "moonshotai/Kimi-K2-Thinking",
  ],
  "nvidia": [
- "nvidia-nemotron-3-super-120b-a12b",
- "nvidia-nemotron-3-nano-30b-a3b",
+ "nvidia/nemotron-3-super-120b-a12b",
+ "nvidia/nemotron-3-nano-30b-a3b",
  ],
 }
 
@@ -258,7 +258,7 @@ _PROVIDER_LABELS = {
  "kilocode": "Kilo Code",
  "alibaba": "Alibaba Cloud (DashScope)",
  "huggingface": "Hugging Face",
- "nvidia": "NVIDIA",
+ "nvidia": "NVIDIA NIM",
  "custom": "Custom endpoint",
 }
 

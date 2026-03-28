@@ -80,6 +80,7 @@ _DEFAULT_PROVIDER_MODELS = {
     "minimax-cn": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed", "MiniMax-M2.1"],
     "ai-gateway": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5", "google/gemini-3-flash"],
     "kilocode": ["anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4", "google/gemini-3-pro-preview", "google/gemini-3-flash-preview"],
+    "nvidia": ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-nano-30b-a3b"],
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B", "Qwen/Qwen3-235B-A22B-Thinking-2507",
         "Qwen/Qwen3-Coder-480B-A35B-Instruct", "deepseek-ai/DeepSeek-R1-0528",
@@ -889,6 +890,7 @@ def setup_model_provider(config: dict):
         "OpenCode Go (open models, $10/month subscription)",
         "GitHub Copilot (uses GITHUB_TOKEN or gh auth token)",
         "GitHub Copilot ACP (spawns `copilot --acp --stdio`)",
+        "NVIDIA NIM (integrate.api.nvidia.com/v1)",
         "Hugging Face Inference Providers (20+ open models)",
     ]
     if keep_label:
@@ -1553,8 +1555,40 @@ def setup_model_provider(config: dict):
         _set_model_provider(config, "huggingface", pconfig.inference_base_url)
         selected_base_url = pconfig.inference_base_url
 
-    # else: provider_idx == 17 (Keep current) — only shown when a provider already exists
-    # Normalize "keep current" to an explicit provider so downstream logic
+    elif provider_idx == 17:  # NVIDIA NIM
+        selected_provider = "nvidia"
+        print()
+        print_header("NVIDIA NIM API Key")
+        pconfig = PROVIDER_REGISTRY["nvidia"]
+        print_info(f"Provider: {pconfig.name}")
+        print_info(f"Base URL: {pconfig.inference_base_url}")
+        print_info("Get your API key at: https://build.nvidia.com/settings/api-keys")
+        print()
+
+        existing_key = get_env_value("NVIDIA_API_KEY")
+        if existing_key:
+            print_info(f"Current: {existing_key[:8]}... (configured)")
+            if prompt_yes_no("Update API key?", False):
+                api_key = prompt("  NVIDIA API key", password=True)
+                if api_key:
+                    save_env_value("NVIDIA_API_KEY", api_key)
+                    print_success("NVIDIA API key updated")
+        else:
+            api_key = prompt("  NVIDIA API key", password=True)
+            if api_key:
+                save_env_value("NVIDIA_API_KEY", api_key)
+                print_success("NVIDIA API key saved")
+            else:
+                print_warning("Skipped - agent won't work without an API key")
+
+        if existing_custom:
+            save_env_value("OPENAI_BASE_URL", "")
+            save_env_value("OPENAI_API_KEY", "")
+        _set_model_provider(config, "nvidia", pconfig.inference_base_url)
+        selected_base_url = pconfig.inference_base_url
+
+    # else: provider_idx == 18 (Keep current) — only shown when a provider already exists
+
     # doesn't fall back to the generic OpenRouter/static-model path.
     if selected_provider is None:
         if current_config_provider:
