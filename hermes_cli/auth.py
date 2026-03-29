@@ -172,14 +172,6 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("MINIMAX_CN_API_KEY",),
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
-    "deepseek": ProviderConfig(
-        id="deepseek",
-        name="DeepSeek",
-        auth_type="api_key",
-        inference_base_url="https://api.deepseek.com/v1",
-        api_key_env_vars=("DEEPSEEK_API_KEY",),
-        base_url_env_var="DEEPSEEK_BASE_URL",
-    ),
     "ai-gateway": ProviderConfig(
         id="ai-gateway",
         name="AI Gateway",
@@ -227,6 +219,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://router.huggingface.co/v1",
         api_key_env_vars=("HF_TOKEN",),
         base_url_env_var="HF_BASE_URL",
+    ),
+    "deepseek": ProviderConfig(
+        id="deepseek",
+        name="DeepSeek",
+        auth_type="api_key",
+        inference_base_url="https://api.deepseek.com/v1",
+        api_key_env_vars=("DEEPSEEK_API_KEY",),
+        base_url_env_var="DEEPSEEK_BASE_URL",
     ),
 }
 
@@ -745,7 +745,7 @@ def resolve_provider(
         # GitHub tokens are commonly present for repo/tool access but should not
         # hijack inference auto-selection unless the user explicitly chooses
         # Copilot/GitHub Models as the provider.
-        if pid == "copilot":
+        if pid in {"copilot", "nvidia", "deepseek"}:
             continue
         for env_var in pconfig.api_key_env_vars:
             if has_usable_secret(os.getenv(env_var, "")):
