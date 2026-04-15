@@ -5854,9 +5854,17 @@ class HermesCLI:
     # -----------------------------------------------------------------
 
     def _handle_fanout_command(self, cmd: str):
-        """Decompose task into stories, run /deliver per story, serialize state."""
+        """Decompose task into stories, present plan for review, execute on accept.
+
+        Uses FanoutReviewFSM to enforce correct state transitions:
+          idle -> decomposing -> plan_ready -> confirmed -> executing -> complete
+          plan_ready -> critiquing -> decomposing (critique cycle)
+          plan_ready -> editing -> plan_ready (edit cycle)
+          any -> aborted (abort)
+        """
         from pathlib import Path as _Path
         import datetime as _dt
+        from hermes_cli.fanout_fsm import FanoutReviewFSM, FanoutTransitionError
         _dash = "\u2500"
 
         parts = cmd.strip().split(maxsplit=1)
@@ -5869,144 +5877,212 @@ class HermesCLI:
         workdir = _Path(os.getenv("TERMINAL_CWD", os.getcwd()))
         fanout_dir = workdir / ".fanout"
         stories_dir = fanout_dir / "stories"
-
-        # --- Resume check ---
         existing_plan = fanout_dir / "plan.yaml"
-        _resume = False
-        if existing_plan.exists():
-            try:
-                import yaml as _yaml
-                plan_data = _yaml.safe_load(existing_plan.read_text())
-            except ImportError:
-                import re as _re
-                raw = existing_plan.read_text()
-                plan_data = json.loads(raw) if raw.strip().startswith("{") else {"task": task, "stories": [], "completed": []}
-            stored_task = (plan_data.get("task") or "").strip()
-            stored_completed = set(plan_data.get("completed", []))
-            stored_stories = plan_data.get("stories", [])
-            # Task mismatch → stale plan from a prior project; nuke and decompose fresh
-            if stored_task and stored_task != task:
-                _cprint(f"  Found stale .fanout/ (different task) — clearing and re-decomposing")
-                import shutil as _shutil
-                if fanout_dir.exists():
-                    _shutil.rmtree(fanout_dir)
-                existing_plan = fanout_dir / "plan.yaml"
-            elif len(stored_completed) >= len(stored_stories) and stored_stories:
-                # All stories already done — nothing to resume
-                _cprint(f"  Found complete .fanout/ ({len(stored_completed)}/{len(stored_stories)} stories) — clearing for fresh run")
-                import shutil as _shutil
-                if fanout_dir.exists():
-                    _shutil.rmtree(fanout_dir)
-                existing_plan = fanout_dir / "plan.yaml"
-            else:
-                # Incomplete — ask user whether to resume or start fresh
-                _n_done = len(stored_completed)
-                _n_total = len(stored_stories)
-                _remaining = [s.get("name", s.get("id", "?")) for s in stored_stories if s.get("id") not in stored_completed]
-                _cprint(f"  Found incomplete .fanout/ — {_n_done}/{_n_total} stories done")
-                _cprint(f"  Remaining: {', '.join(_remaining)}")
-                _answer = input("  Resume? [Y/n] ").strip().lower()
-                if _answer in ("n", "no"):
-                    _cprint(f"  Clearing and re-decomposing")
-                    import shutil as _shutil
-                    if fanout_dir.exists():
-                        _shutil.rmtree(fanout_dir)
-                    existing_plan = fanout_dir / "plan.yaml"
+
+        # --- Phase 0: .fanout exists? ---
+        critique = None  # accumulated user critique, fed back into decomposition
+        plan_data = None  # loaded from disk if exists
+
+        # Initialize FSM once — persists across critique cycles
+        fsm = FanoutReviewFSM()
+
+        while True:  # review gate loop — critique returns here
+            if existing_plan.exists():
+                plan_data = self._load_fanout_plan(existing_plan)
+                stored_task = (plan_data.get("task") or "").strip() if plan_data else ""
+                stored_completed = set(plan_data.get("completed", [])) if plan_data else set()
+                stored_stories = plan_data.get("stories", []) if plan_data else []
+
+                if plan_data is None or (stored_task and stored_task != task):
+                    _cprint(f"  Found stale .fanout/ (different task)")
+                    plan_data = None  # force re-decomposition
+                elif len(stored_completed) >= len(stored_stories) and stored_stories:
+                    _cprint(f"  Found complete .fanout/ ({len(stored_completed)}/{len(stored_stories)} stories done)")
+                    _answer = self._fanout_prompt(
+                        "Found complete .fanout/ — re-run, re-plan, or abort?",
+                        choices=[("r", "Re-run"), ("p", "Re-plan"), ("a", "Abort")],
+                    )
+                    if _answer == "a":
+                        return
+                    elif _answer == "p":
+                        plan_data = None  # force re-decomposition
+                    else:
+                        # Re-run: sync FSM to plan_ready then straight to execution
+                        self._sync_fsm_to_plan_ready(fsm, task, plan_data)
                 else:
-                    _cprint(f"  Resuming from story {_n_done + 1}")
-                    stories = stored_stories
-                    task = stored_task
-                    _resume = True
+                    if stored_completed:
+                        _cprint(f"  Found .fanout/ \u2014 {len(stored_completed)}/{len(stored_stories)} done")
+                        _remaining = [s.get("name", s.get("id", "?")) for s in stored_stories if s.get("id") not in stored_completed]
+                        _cprint(f"  Remaining: {', '.join(_remaining)}")
 
-        if not _resume:
-            # --- Phase 1: Decompose via delegate_task ---
-            _cprint(f"  🔀 Fanout: decomposing task...")
-            # Lazy-init agent if this is the first command (no prior chat message)
-            if self.agent is None:
-                if not self._init_agent():
-                    _cprint("  ❌ Could not initialize agent — check credentials")
-                    return
-            # Set up spinner for decomposition
-            _decomp_spin = None
-            _print_fn = getattr(self.agent, '_print_fn', None)
-            try:
-                import random as _random
-                from agent.display import KawaiiSpinner
-                _face = _random.choice(KawaiiSpinner.KAWAII_WAITING)
-                _decomp_spin = KawaiiSpinner(f"{_face} fanout: decomposing", spinner_type='dots', print_fn=_print_fn)
-                _decomp_spin.start()
-                self.agent._delegate_spinner = _decomp_spin
-            except Exception:
-                self.agent._delegate_spinner = None
-            try:
-                decomp_result = self._deliver_dispatch(
-                    goal=(
-                        f"Decompose this task into 3-7 ordered stories. Each story must be "
-                        f"narrow enough to complete in one session.\n\n"
-                        f"Output ONLY valid JSON (no markdown):\n"
-                        f'{{"stories": [{{"id": "001", "name": "...", "description": "...", '
-                        f'"dependencies": [], "acceptance": ["criterion 1", "criterion 2"]}}]}}\n\n'
-                        f"TASK:\n{task}"
-                    ),
-                    context="You are a senior architect. Output ONLY valid JSON. No commentary.",
-                    toolsets=["terminal", "file"],
-                    max_iterations=10,
-                )
-            finally:
-                self.agent._delegate_spinner = None
-                if _decomp_spin:
+                    # keep / kill
+                    _answer = self._fanout_prompt(
+                        "Keep or kill this .fanout?",
+                        choices=[("K", "Keep"), ("k", "Kill")],
+                    )
+                    if _answer == "k":
+                        # Archive to /tmp so it's out of git but recoverable
+                        import shutil as _shutil
+                        import tempfile as _tmp
+                        _archive = _Path(_tmp.gettempdir()) / f"fanout_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                        try:
+                            _shutil.move(str(fanout_dir), str(_archive))
+                            _cprint(f"  Archived .fanout/ to {_archive}")
+                        except Exception:
+                            if fanout_dir.exists():
+                                _shutil.rmtree(fanout_dir)
+                            _cprint(f"  Removed .fanout/")
+                        plan_data = None
+                    else:
+                        # Keep existing plan — sync FSM state to match
+                        # so the review gate sees plan_ready and can prompt
+                        # with the correct modal options.
+                        if not plan_data.get("stories"):
+                            plan_data = None  # no real stories, re-decompose
+                        else:
+                            _cprint(f"  Keeping existing plan \u2014 entering review.")
+                            self._sync_fsm_to_plan_ready(fsm, task, plan_data)
+
+            if plan_data is None or not plan_data.get("stories"):
+                # --- Phase 1: Decompose (FSM: idle -> decomposing) ---
+                # If FSM already started (critique cycle), use re_decompose
+                if fsm.state.value == "decomposing" or fsm.state.value == "critiquing":
                     try:
-                        _decomp_spin.stop("decomposition done")
-                    except Exception:
-                        pass
-            try:
-                import re as _re
-                # Check for error string returned by _deliver_dispatch
-                if not decomp_result or not decomp_result.strip():
-                    _cprint("  \u274c Decomposition failed: subagent returned empty response")
-                    _cprint("  The model may have hit a rate limit or timeout. Try again.")
-                    return
-                clean = _re.sub(r'^```(?:json)?\s*', '', decomp_result.strip())
-                clean = _re.sub(r'\s*```\s*$', '', clean)
-                match = _re.search(r'\{.*\}', clean, _re.DOTALL)
-                if not match:
-                    # Likely an error message from _deliver_dispatch, not JSON
-                    _cprint(f"  \u274c Decomposition failed: subagent did not return JSON")
-                    _cprint(f"  Response: {decomp_result[:300]}")
-                    return
-                decomp_data = json.loads(match.group())
-                stories = decomp_data.get("stories", [])
-                if not stories:
-                    _cprint("  \u274c Decomposition produced no stories")
-                    _cprint(f"  Response: {decomp_result[:300]}")
-                    return
-            except (json.JSONDecodeError, AttributeError) as e:
-                _cprint(f"  \u274c Decomposition failed: {e}")
-                _cprint(f"  Raw output: {decomp_result[:300]}")
-                return
+                        fsm.re_decompose()
+                    except FanoutTransitionError:
+                        # Already decomposing or wrong state — start fresh
+                        fsm = FanoutReviewFSM()
+                        fsm.start(task)
+                else:
+                    fsm.start(task)
 
-            # Persist
-            stories_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                import yaml as _yaml
-                for s in stories:
-                    slug = s.get('name', 'untitled').replace(' ', '-').lower()
-                    story_file = stories_dir / f"{s['id']}-{slug}.yaml"
-                    story_file.write_text(_yaml.dump(s, default_flow_style=False))
-                plan = {"task": task, "stories": stories, "completed": []}
-                existing_plan.write_text(_yaml.dump(plan, default_flow_style=False))
-            except ImportError:
-                # Fallback: JSON persistence
-                for s in stories:
-                    slug = s.get('name', 'untitled').replace(' ', '-').lower()
-                    story_file = stories_dir / f"{s['id']}-{slug}.json"
-                    story_file.write_text(json.dumps(s, indent=2))
-                plan = {"task": task, "stories": stories, "completed": []}
-                existing_plan.write_text(json.dumps(plan, indent=2))
+                plan_data = self._fanout_decompose(fsm, task, fanout_dir, stories_dir, existing_plan)
+                if plan_data is None:
+                    return  # decomposition failed or was aborted
+                critique = None  # reset after successful decomposition
 
-            _cprint(f"  Created {len(stories)} stories in .fanout/")
+            # --- Review gate (FSM: plan_ready -> accept/critique/edit/abort) ---
+            review_data = plan_data
+            while True:
+                # Load latest plan from disk (user may have edited)
+                if existing_plan.exists():
+                    review_data = self._load_fanout_plan(existing_plan) or plan_data
+                plan_stories = review_data.get("stories", [])
+                plan_task = review_data.get("task", task)
+                completed = set(review_data.get("completed", []))
 
-        # --- Phase 2: Execute stories ---
+                self._print_fanout_plan(plan_stories, plan_task, completed)
+                _cprint(f"  Plan file: {existing_plan}")
+                _cprint(f"")
+
+                # Build numbered menu dynamically based on current FSM state.
+                # Only show options whose transitions are valid from the
+                # current state so the user always sees exactly what applies.
+                _state = fsm.state
+                _allowed = {
+                    # accept: only from plan_ready
+                    "accept": _state.value == "plan_ready",
+                    # edit: only from plan_ready
+                    "edit": _state.value == "plan_ready",
+                    # critique: only from plan_ready
+                    "critique": _state.value == "plan_ready",
+                    # resume_review: only from editing
+                    "resume_review": _state.value == "editing",
+                    # abort: available from any active state
+                    "abort": _state.value not in ("complete", "aborted"),
+                }
+                _options = [
+                    ("accept",  "Accept the plan and proceed to execution", _allowed["accept"]),
+                    ("edit",    "Open the plan file for editing", _allowed["edit"]),
+                    ("critique","Provide critique feedback for re-decomposition", _allowed["critique"]),
+                    ("abort",   "Abort the fanout", _allowed["abort"]),
+                ]
+                # If in editing state, add resume option
+                if _allowed["resume_review"]:
+                    _options.append(
+                        ("resume_review", "Done editing — resume review", True)
+                    )
+
+                # Filter to only enabled options for the fanout prompt
+                _active_choices = [(label, desc) for label, desc, enabled in _options if enabled]
+                if not _active_choices:
+                    _cprint(f"  No available actions from state '{_state.value}'.")
+                    return
+
+                _cprint(f"  Review options:")
+                for i, (_label, _desc) in enumerate(_active_choices, 1):
+                    _cprint(f"    {i}. {_desc}")
+                _cprint(f"")
+
+                _selected = self._fanout_prompt(
+                    "Select option",
+                    choices=_active_choices,
+                )
+
+                if not _selected:
+                    _cprint(f"  Invalid option. Please try again.")
+                    continue
+
+                if _selected == "accept":
+                    # Accept — transition FSM to confirmed, then executing
+                    try:
+                        fsm.accept()
+                        fsm.execute()
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error: {exc}")
+                        return
+                    break  # break inner review loop, proceed to execution
+                elif _selected == "edit":
+                    try:
+                        fsm.edit()
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error: {exc}")
+                        continue
+                    _cprint(f"  Edit {existing_plan} or files in .fanout/stories/.")
+                    # Wait for user to finish editing (freetext prompt that just blocks)
+                    self._fanout_prompt("Press Enter when done editing to resume review...", freetext=True)
+                    try:
+                        fsm.resume_review()
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error resuming: {exc}")
+                        return
+                    continue  # loop back to re-render the plan with plan_ready options
+                elif _selected == "critique":
+                    _critique_text = self._fanout_prompt("Your critique", freetext=True)
+                    if not _critique_text:
+                        _cprint(f"  No critique provided — returning to menu.")
+                        continue
+                    try:
+                        fsm.critique(_critique_text)
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error: {exc}")
+                        return
+                    _cprint(f"  Re-decomposing with your feedback...")
+                    plan_data = None  # force fresh decomposition
+                    break  # break inner review loop, go to decomposition
+                elif _selected == "abort":
+                    try:
+                        fsm.abort()
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error: {exc}")
+                    _cprint(f"  Fanout aborted.")
+                    return
+                elif _selected == "resume_review":
+                    try:
+                        fsm.resume_review()
+                    except FanoutTransitionError as exc:
+                        _cprint(f"  Error: {exc}")
+                        return
+                    continue  # loop back to re-render the plan with plan_ready options
+
+            # If we got here after critique (not accept), loop back to decomposition
+            if plan_data is None:
+                continue
+
+            # Accept confirmed — break out of outer review gate loop into execution
+            break
+
+        # --- Phase 2: Execute stories (FSM: executing) ---
         try:
             import yaml as _yaml
             plan = _yaml.safe_load(existing_plan.read_text())
@@ -6028,6 +6104,7 @@ class HermesCLI:
 
             if sid in completed:
                 _cprint(f"\n  Story {sid} ({sname}) \u2014 already complete, skipping")
+                fsm.story_done(sid)
                 continue
 
             blocked = [d for d in deps if d not in completed]
@@ -6039,7 +6116,6 @@ class HermesCLI:
             _cprint(f"  STORY {sid}: {sname}")
             _cprint(f"  {_dash * 50}")
 
-            # Build task from story acceptance criteria
             acceptance = story.get("acceptance", [])
             desc = story.get("description", sname)
             story_task = (
@@ -6048,10 +6124,8 @@ class HermesCLI:
                 + "\n".join(f"  - {a}" for a in acceptance)
             )
 
-            # Run the enforced deliver loop for this story
             self._handle_deliver_command(f"/deliver {story_task}")
 
-            # Mark complete
             completed.add(sid)
             plan["completed"] = sorted(completed)
             try:
@@ -6060,7 +6134,8 @@ class HermesCLI:
             except ImportError:
                 existing_plan.write_text(json.dumps(plan, indent=2))
 
-            # Journal append
+            fsm.story_done(sid)
+
             entry = (
                 f"\n## Story {sid}: {sname} \u2014 COMPLETE\n"
                 f"- Completed at: {_dt.datetime.now().isoformat()}\n"
@@ -6069,8 +6144,209 @@ class HermesCLI:
             with open(journal_path, "a") as jf:
                 jf.write(entry)
 
+        # Mark all done in FSM
+        try:
+            fsm.all_stories_done()
+        except FanoutTransitionError:
+            pass
+
         _cprint(f"\n  \u2705 Fanout complete: {len(completed)}/{len(stories)} stories done")
         _cprint(f"  Journal: {journal_path}")
+
+    def _sync_fsm_to_plan_ready(self, fsm, task, plan_data):
+        """Drive a fresh FSM from IDLE to PLAN_READY using an existing plan.
+
+        This is needed because the FSM is re-created on every ``/fanout``
+        invocation, but ``.fanout/plan.yaml`` may already contain a valid
+        plan from a prior run.  Without this sync the review gate would
+        see state ``idle`` and refuse all transitions.
+        """
+        from hermes_cli.fanout_fsm import FanoutStory
+        if fsm.state.value != "idle":
+            return  # already driven forward
+        fsm.start(task)
+        fsm_stories = [
+            FanoutStory(
+                id=s.get("id", ""),
+                name=s.get("name", ""),
+                description=s.get("description", ""),
+                dependencies=s.get("dependencies", []),
+                acceptance=s.get("acceptance", []),
+            )
+            for s in plan_data.get("stories", [])
+        ]
+        fsm.decomposition_done(fsm_stories)
+
+    def _load_fanout_plan(self, plan_path):
+        """Load a fanout plan from YAML or JSON."""
+        try:
+            import yaml as _yaml
+            return _yaml.safe_load(plan_path.read_text())
+        except ImportError:
+            raw = plan_path.read_text()
+            if raw.strip().startswith("{"):
+                return json.loads(raw)
+            return None
+
+    def _fanout_decompose(self, fsm, task, fanout_dir, stories_dir, existing_plan):
+        """Run decomposition via the FSM. Returns plan_data or None on failure."""
+        if not self._init_agent():
+            _cprint("  Could not initialize agent \u2014 check credentials")
+            try:
+                fsm.abort()
+            except FanoutTransitionError:
+                pass
+            return None
+
+        _decomp_spin = None
+        _print_fn = getattr(self.agent, '_print_fn', None)
+        try:
+            import random as _random
+            from agent.display import KawaiiSpinner
+            _face = _random.choice(KawaiiSpinner.KAWAII_WAITING)
+            label = f"{_face} fanout: decomposing"
+            _decomp_spin = KawaiiSpinner(label, spinner_type='dots', print_fn=_print_fn)
+            _decomp_spin.start()
+            self.agent._delegate_spinner = _decomp_spin
+        except Exception:
+            self.agent._delegate_spinner = None
+
+        # Pull accumulated critique from FSM
+        critique = fsm.accumulated_critique
+        crit_note = f"\n\nUSER CRITIQUE FROM PREVIOUS ROUND (address this):\n{critique}" if critique else ""
+        try:
+            decomp_result = self._deliver_dispatch(
+                goal=(
+                    f"Decompose this task into 3-7 ordered stories. Each story must be "
+                    f"narrow enough to complete in one session.\n\n"
+                    f"Output ONLY valid JSON (no markdown):\n"
+                    f'{{"stories": [{{"id": "001", "name": "...", "description": "...", '
+                    f'"dependencies": [], "acceptance": ["criterion 1", "criterion 2"]}}]}}\n\n'
+                    f"TASK:\n{task}{crit_note}"
+                ),
+                context="You are a senior architect. Output ONLY valid JSON. No commentary.",
+                toolsets=["terminal", "file"],
+                max_iterations=10,
+            )
+        finally:
+            self.agent._delegate_spinner = None
+            if _decomp_spin:
+                try:
+                    _decomp_spin.stop("decomposition done")
+                except Exception:
+                    pass
+
+        import re as _re
+        if not decomp_result or not decomp_result.strip():
+            _cprint("  Decomposition failed: subagent returned empty response")
+            try:
+                fsm.decomposition_fail()
+            except FanoutTransitionError:
+                pass
+            return None
+
+        clean = _re.sub(r'^```(?:json)?\s*', '', decomp_result.strip())
+        clean = _re.sub(r'\s*```\s*$', '', clean)
+        match = _re.search(r'\{.*\}', clean, _re.DOTALL)
+        if not match:
+            _cprint(f"  Decomposition failed: subagent did not return JSON")
+            _cprint(f"  Response: {decomp_result[:300]}")
+            try:
+                fsm.decomposition_fail()
+            except FanoutTransitionError:
+                pass
+            return None
+
+        try:
+            decomp_data = json.loads(match.group())
+        except json.JSONDecodeError as e:
+            _cprint(f"  Decomposition failed: {e}")
+            try:
+                fsm.decomposition_fail()
+            except FanoutTransitionError:
+                pass
+            return None
+
+        stories = decomp_data.get("stories", [])
+        if not stories:
+            _cprint("  Decomposition produced no stories")
+            try:
+                fsm.decomposition_fail()
+            except FanoutTransitionError:
+                pass
+            return None
+
+        # Build FanoutStory objects for the FSM
+        from hermes_cli.fanout_fsm import FanoutStory
+        fsm_stories = [
+            FanoutStory(
+                id=s.get("id", ""),
+                name=s.get("name", ""),
+                description=s.get("description", ""),
+                dependencies=s.get("dependencies", []),
+                acceptance=s.get("acceptance", []),
+            )
+            for s in stories
+        ]
+
+        # Transition to plan_ready
+        fsm.decomposition_done(fsm_stories)
+
+        # Persist raw story dicts to disk
+        stories_dir.mkdir(parents=True, exist_ok=True)
+        def _safe_slug(name):
+            """Sanitize story name into a flat filename slug."""
+            import re as _slug_re
+            slug = name.replace(' ', '-').lower()
+            slug = _slug_re.sub(r'[^a-z0-9._-]', '', slug)
+            return slug or 'untitled'
+        try:
+            import yaml as _yaml
+            for s in stories:
+                slug = _safe_slug(s.get('name', 'untitled'))
+                story_file = stories_dir / f"{s['id']}-{slug}.yaml"
+                story_file.write_text(_yaml.dump(s, default_flow_style=False))
+            plan = {"task": task, "stories": stories, "completed": []}
+            existing_plan.write_text(_yaml.dump(plan, default_flow_style=False))
+        except ImportError:
+            for s in stories:
+                slug = _safe_slug(s.get('name', 'untitled'))
+                story_file = stories_dir / f"{s['id']}-{slug}.json"
+                story_file.write_text(json.dumps(s, indent=2))
+            plan = {"task": task, "stories": stories, "completed": []}
+            existing_plan.write_text(json.dumps(plan, indent=2))
+
+        _cprint(f"  Created {len(stories)} stories in .fanout/")
+        return plan
+
+    def _print_fanout_plan(self, stories, task, completed=None):
+        """Render a fanout plan for review in the terminal."""
+        completed = completed or set()
+        _dash = "\u2500"
+        print(f"\n  {'='*60}")
+        print(f"  FANOUT PLAN")
+        print(f"  {'='*60}")
+        print(f"  Task: {task}")
+        print(f"  Stories: {len(stories)}")
+        print(f"  {'='*60}")
+        for i, s in enumerate(stories, 1):
+            sid = s.get("id", "?")
+            sname = s.get("name", "unnamed")
+            status = "DONE" if sid in completed else f"  {i}/{len(stories)}"
+            deps = s.get("dependencies", [])
+            dep_str = f"  (after: {', '.join(deps)})" if deps else ""
+            print(f"\n  [{status}] Story {sid}: {sname} {dep_str}")
+            print(f"  {_dash * 40}")
+            desc = s.get("description", "")
+            if desc:
+                for line in desc.split("\n"):
+                    print(f"    {line}")
+            acceptance = s.get("acceptance", [])
+            if acceptance:
+                print(f"    Acceptance:")
+                for a in acceptance:
+                    print(f"      - {a}")
+        print(f"\n  {'='*60}\n")
 
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
@@ -7803,6 +8079,72 @@ class HermesCLI:
         self._approval_state = None
         self._invalidate()
 
+    def _fanout_prompt(self, prompt_text: str,
+                       choices: list[tuple[str, str]] | None = None,
+                       freetext: bool = False,
+                       timeout: int = 300) -> str:
+        """Prompt for user input through the prompt_toolkit UI — fanout review gate.
+
+        Works like ``input()`` but is compatible with prompt_toolkit's terminal
+        ownership.  The calling thread (typically the process_loop background
+        thread) blocks until the user responds via the TUI.
+
+        Args:
+            prompt_text: The question / prompt to display.
+            choices: Optional list of ``(key, description)`` tuples.  When
+                provided the UI shows a numbered, arrow-navigable menu and
+                pressing Enter returns the *key* of the highlighted option.
+            freetext: If True, the user types free-form text in the buffer and
+                the method returns whatever they typed (stripped).  Useful for
+                the critique prompt.
+            timeout: Seconds to wait before returning an empty string.
+
+        Returns:
+            The selected choice *key*, the typed text, or ``""`` on timeout /
+            cancellation.
+        """
+        import time as _time
+
+        response_queue = queue.Queue()
+
+        self._capture_modal_input_snapshot()
+
+        self._fanout_state = {
+            "prompt": prompt_text,
+            "choices": choices or [],
+            "selected": 0,
+            "response_queue": response_queue,
+            "freetext": freetext,
+        }
+        self._fanout_freetext = freetext
+        self._invalidate(min_interval=0.0)
+
+        deadline = _time.monotonic() + timeout
+        _last_refresh = _time.monotonic()
+        while True:
+            try:
+                result = response_queue.get(timeout=1)
+                self._fanout_state = None
+                self._fanout_freetext = False
+                self._restore_modal_input_snapshot()
+                self._invalidate()
+                return result
+            except queue.Empty:
+                if _time.monotonic() >= deadline:
+                    break
+                now = _time.monotonic()
+                if now - _last_refresh >= 5.0:
+                    _last_refresh = now
+                    self._invalidate()
+
+        # Timeout
+        self._fanout_state = None
+        self._fanout_freetext = False
+        self._restore_modal_input_snapshot()
+        self._invalidate()
+        _cprint(f"\n  Fanout prompt timed out after {timeout}s")
+        return ""
+
     def _get_approval_display_fragments(self):
         """Render the dangerous-command approval panel for the prompt_toolkit UI."""
         state = self._approval_state
@@ -8143,7 +8485,7 @@ class HermesCLI:
                             # If clarify is active, the Enter handler routes
                             # input directly; this queue shouldn't have anything.
                             # But if it does (race condition), don't interrupt.
-                            if self._clarify_state or self._clarify_freetext:
+                            if self._clarify_state or self._clarify_freetext or self._fanout_state:
                                 continue
                             print("\n⚡ New message detected, interrupting...")
                             # Signal TTS to stop on interrupt
@@ -8495,6 +8837,10 @@ class HermesCLI:
             return _state_fragment("class:sudo-prompt", "🔑")
         if self._approval_state:
             return _state_fragment("class:prompt-working", "⚠")
+        if self._fanout_freetext:
+            return _state_fragment("class:clarify-selected", "✎")
+        if self._fanout_state:
+            return _state_fragment("class:prompt-working", "⚡")
         if self._clarify_freetext:
             return _state_fragment("class:clarify-selected", "✎")
         if self._clarify_state:
@@ -8562,6 +8908,7 @@ class HermesCLI:
         secret_widget,
         approval_widget,
         clarify_widget,
+        fanout_widget=None,
         model_picker_widget=None,
         spinner_widget=None,
         spacer,
@@ -8586,6 +8933,7 @@ class HermesCLI:
                 secret_widget,
                 approval_widget,
                 clarify_widget,
+                fanout_widget,
                 model_picker_widget,
                 spinner_widget,
                 spacer,
@@ -8687,6 +9035,11 @@ class HermesCLI:
         self._approval_deadline = 0
         self._approval_lock = threading.Lock()  # serialize concurrent approval prompts (delegation race fix)
 
+        # Fanout review gate state (same mechanism as clarify — avoids raw input()
+        # which deadlocks inside prompt_toolkit's TUI event loop).
+        self._fanout_state = None       # dict with prompt, choices, selected, response_queue, freetext
+        self._fanout_freetext = False   # True when critique text is being typed
+
         # Slash command loading state
         self._command_running = False
         self._command_status = ""
@@ -8766,6 +9119,24 @@ class HermesCLI:
             # --- Approval selection: confirm the highlighted choice ---
             if self._approval_state:
                 self._handle_approval_selection()
+                event.app.invalidate()
+                return
+
+            # --- Fanout review gate: accept typed text or highlighted choice ---
+            if self._fanout_state:
+                if self._fanout_freetext:
+                    text = event.app.current_buffer.text.strip()
+                    self._fanout_state["response_queue"].put(text)
+                else:
+                    choices = self._fanout_state.get("choices") or []
+                    sel = self._fanout_state.get("selected", 0)
+                    if 0 <= sel < len(choices):
+                        self._fanout_state["response_queue"].put(choices[sel][0])
+                    else:
+                        self._fanout_state["response_queue"].put("")
+                self._fanout_state = None
+                self._fanout_freetext = False
+                event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
@@ -8918,6 +9289,20 @@ class HermesCLI:
                 self._approval_state["selected"] = min(max_idx, self._approval_state["selected"] + 1)
                 event.app.invalidate()
 
+        # --- Fanout review gate: arrow-key navigation ---
+        @kb.add('up', filter=Condition(lambda: bool(self._fanout_state) and not self._fanout_freetext))
+        def fanout_up(event):
+            if self._fanout_state:
+                self._fanout_state["selected"] = max(0, self._fanout_state["selected"] - 1)
+                event.app.invalidate()
+
+        @kb.add('down', filter=Condition(lambda: bool(self._fanout_state) and not self._fanout_freetext))
+        def fanout_down(event):
+            if self._fanout_state:
+                max_idx = len(self._fanout_state.get("choices") or []) - 1
+                self._fanout_state["selected"] = min(max_idx, self._fanout_state["selected"] + 1)
+                event.app.invalidate()
+
         # --- /model picker: arrow-key navigation ---
         @kb.add('up', filter=Condition(lambda: bool(self._model_picker_state)))
         def model_picker_up(event):
@@ -8942,7 +9327,7 @@ class HermesCLI:
         # Buffer.auto_up/auto_down handle both: cursor movement when multi-line,
         # history browsing when on the first/last line (or single-line input).
         _normal_input = Condition(
-            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state and not self._model_picker_state
+            lambda: not self._clarify_state and not self._approval_state and not self._sudo_state and not self._secret_state and not self._model_picker_state and not self._fanout_state
         )
 
         @kb.add('up', filter=_normal_input)
@@ -9005,6 +9390,15 @@ class HermesCLI:
             if self._approval_state:
                 self._approval_state["response_queue"].put("deny")
                 self._approval_state = None
+                event.app.invalidate()
+                return
+
+            # Cancel fanout prompt (return empty to signal abort)
+            if self._fanout_state:
+                self._fanout_state["response_queue"].put("")
+                self._fanout_state = None
+                self._fanout_freetext = False
+                event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
@@ -9577,6 +9971,70 @@ class HermesCLI:
             filter=Condition(lambda: cli_ref._clarify_state is not None),
         )
 
+        # --- Fanout review gate: display widget ---
+
+        def _get_fanout_display():
+            """Build styled text for the fanout review gate panel."""
+            state = cli_ref._fanout_state
+            if not state:
+                return []
+
+            prompt = state.get("prompt", "")
+            choices = state.get("choices") or []
+            selected = state.get("selected", 0)
+            freetext = cli_ref._fanout_freetext
+
+            title = "Fanout Review"
+            preview_lines = _wrap_panel_text(prompt, 60)
+
+            if not freetext and choices:
+                for i, (key, desc) in enumerate(choices):
+                    prefix = "❯ " if i == selected else "  "
+                    preview_lines.extend(_wrap_panel_text(f"{prefix}{desc}", 60, subsequent_indent="  "))
+            elif freetext:
+                guidance = "Type your response below, then press Enter."
+                preview_lines.extend(_wrap_panel_text(guidance, 60))
+
+            box_width = _panel_box_width(title, preview_lines)
+            inner_text_width = max(8, box_width - 2)
+
+            lines = []
+            # Box top border
+            lines.append(('class:fanout-border', '╭─ '))
+            lines.append(('class:fanout-title', title))
+            lines.append(('class:fanout-border', ' ' + ('─' * max(0, box_width - len(title) - 3)) + '╮\n'))
+            _append_blank_panel_line(lines, 'class:fanout-border', box_width)
+
+            # Prompt text
+            for wrapped in _wrap_panel_text(prompt, inner_text_width):
+                _append_panel_line(lines, 'class:fanout-border', 'class:fanout-prompt', wrapped, box_width)
+            _append_blank_panel_line(lines, 'class:fanout-border', box_width)
+
+            if not freetext and choices:
+                # Multiple-choice mode: show selectable options
+                for i, (key, desc) in enumerate(choices):
+                    style = 'class:fanout-selected' if i == selected else 'class:fanout-choice'
+                    prefix = '❯ ' if i == selected else '  '
+                    wrapped_lines = _wrap_panel_text(f"{prefix}{desc}", inner_text_width, subsequent_indent="  ")
+                    for wrapped in wrapped_lines:
+                        _append_panel_line(lines, 'class:fanout-border', style, wrapped, box_width)
+            elif freetext:
+                guidance = "Type your response below, then press Enter."
+                for wrapped in _wrap_panel_text(guidance, inner_text_width):
+                    _append_panel_line(lines, 'class:fanout-border', 'class:fanout-choice', wrapped, box_width)
+
+            _append_blank_panel_line(lines, 'class:fanout-border', box_width)
+            lines.append(('class:fanout-border', '╰' + ('─' * box_width) + '╯\n'))
+            return lines
+
+        fanout_widget = ConditionalContainer(
+            Window(
+                FormattedTextControl(_get_fanout_display),
+                wrap_lines=True,
+            ),
+            filter=Condition(lambda: cli_ref._fanout_state is not None),
+        )
+
         # --- Sudo password: display widget ---
 
         def _get_sudo_display():
@@ -9782,6 +10240,7 @@ class HermesCLI:
                     secret_widget=secret_widget,
                     approval_widget=approval_widget,
                     clarify_widget=clarify_widget,
+                    fanout_widget=fanout_widget,
                     model_picker_widget=model_picker_widget,
                     spinner_widget=spinner_widget,
                     spacer=spacer,
@@ -9827,6 +10286,12 @@ class HermesCLI:
             'clarify-selected': '#FFD700 bold',
             'clarify-active-other': '#FFD700 italic',
             'clarify-countdown': '#CD7F32',
+            # Fanout review gate panel
+            'fanout-border': '#CD7F32',
+            'fanout-title': '#FFD700 bold',
+            'fanout-prompt': '#FFF8DC bold',
+            'fanout-choice': '#AAAAAA',
+            'fanout-selected': '#FFD700 bold',
             # Sudo password panel
             'sudo-prompt': '#FF6B6B bold',
             'sudo-border': '#CD7F32',
