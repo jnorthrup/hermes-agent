@@ -5421,6 +5421,10 @@ class HermesCLI:
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
             self._handle_personality_command(cmd_original)
+        elif canonical == "deliver":
+            self._handle_deliver_command(cmd_original)
+        elif canonical == "fanout":
+            self._handle_fanout_command(cmd_original)
         elif canonical == "plan":
             self._handle_plan_command(cmd_original)
         elif canonical == "retry":
@@ -5653,7 +5657,421 @@ class HermesCLI:
             self._pending_input.put(msg)
         else:
             ChatConsole().print("[bold red]Plan mode unavailable: input queue not initialized[/]")
-    
+
+    # -----------------------------------------------------------------
+    # /deliver — enforced actor-critic loop
+    # -----------------------------------------------------------------
+
+    def _deliver_dispatch(self, goal: str, context: str, toolsets: list,
+                          max_iterations: int = 50) -> str:
+        """Call delegate_task through the registry — bypasses agent interpretation."""
+        # Lazy-init agent if this is the first command (no prior chat message)
+        if self.agent is None:
+            if not self._init_agent():
+                return "Error: could not initialize agent — check credentials"
+        from tools.registry import registry
+        result_json = registry.dispatch(
+            "delegate_task",
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "max_iterations": max_iterations,
+            },
+            parent_agent=self.agent,
+        )
+        # delegate_task returns JSON string; extract the final_response
+        try:
+            data = json.loads(result_json)
+            # Batch mode returns results array; single mode returns final_response
+            if "results" in data:
+                parts = []
+                for r in data["results"]:
+                    # summary may be present but None — use explicit None check
+                    val = r.get("summary")
+                    if val:
+                        parts.append(val)
+                    else:
+                        err = r.get("error") or "no result"
+                        parts.append(err)
+                return "\n\n".join(parts)
+            return data.get("final_response", data.get("error", result_json))
+        except (json.JSONDecodeError, TypeError):
+            return result_json
+
+    def _parse_verdict(self, critic_output: str) -> dict:
+        """Extract verdict JSON from critic response."""
+        import re as _re
+        match = _re.search(
+            r'\{[^{}]*"verdict"[^{}]*\}',
+            critic_output, _re.DOTALL,
+        )
+        if match:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                pass
+        # Fallback: try the whole text
+        try:
+            return json.loads(critic_output.strip())
+        except (json.JSONDecodeError, TypeError):
+            return {"verdict": "EDIT", "feedback": critic_output[:500],
+                    "demands": ["unclear verdict from critic"]}
+
+    def _handle_deliver_command(self, cmd: str):
+        """Enforced actor-critic delivery loop.
+
+        Imperative code — calls delegate_task directly via the tool registry.
+        The agent loop is not involved. The loop runs until COMPLETE or max rounds.
+        """
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /deliver <task description>")
+            _cprint("  Example: /deliver Implement connection pooling in src/http.py")
+            return
+
+        task = parts[1].strip()
+        max_rounds = 5
+        previous_output = None
+        feedback = None
+        action = "RESTART"
+
+        _dash = "\u2500"
+        _cprint(f"  \U0001f500 Deliver: {task[:80]}{'...' if len(task) > 80 else ''}")
+        _cprint(f"  Max rounds: {max_rounds}")
+
+        for rnd in range(1, max_rounds + 1):
+            _cprint(f"\n  {_dash * 2} Round {rnd}/{max_rounds} {_dash * 2}")
+
+            # --- WORKER ---
+            if action == "RESTART" or previous_output is None:
+                worker_goal = (
+                    f"TASK:\n{task}\n\n"
+                    f"Implement now. Write complete code. No TODOs, no stubs, no placeholders.\n"
+                    f"Include tests if the task implies correctness requirements.\n"
+                    f"Run your tests before finishing."
+                )
+            else:
+                worker_goal = (
+                    f"TASK:\n{task}\n\n"
+                    f"PREVIOUS IMPLEMENTATION:\n{previous_output}\n\n"
+                    f"CRITIC FEEDBACK \u2014 address ALL of these:\n{feedback}\n\n"
+                    f"Edit the previous implementation. Do not regress on anything working."
+                )
+
+            _cprint("  Worker starting...")
+            # Lazy-init agent if this is the first command (no prior chat message)
+            if self.agent is None:
+                if not self._init_agent():
+                    _cprint("  \u274c Could not initialize agent \u2014 check credentials")
+                    return
+            # Set up spinner so child progress is visible
+            import random as _random
+            from agent.display import KawaiiSpinner
+            _spin = None
+            _print_fn = getattr(self.agent, '_print_fn', None)
+            try:
+                _face = _random.choice(KawaiiSpinner.KAWAII_WAITING)
+                _spin = KawaiiSpinner(f"{_face} deliver: worker", spinner_type='dots', print_fn=_print_fn)
+                _spin.start()
+                self.agent._delegate_spinner = _spin
+            except Exception:
+                self.agent._delegate_spinner = None
+            try:
+                worker_result = self._deliver_dispatch(
+                    goal=worker_goal,
+                    context="You are a senior implementation agent. Do the work \u2014 write code, run tests, fix errors. No describing, only doing.",
+                    toolsets=["terminal", "file", "web"],
+                )
+            finally:
+                self.agent._delegate_spinner = None
+                if _spin:
+                    try:
+                        _spin.stop("worker done")
+                    except Exception:
+                        pass
+            _cprint(f"  Worker done ({len(worker_result)} chars)")
+
+            # --- CRITIC ---
+            _cprint("  Critic reviewing...")
+            critic_goal = (
+                f"TASK:\n{task}\n\n"
+                f"WORKER TRANSCRIPT:\n{worker_result}\n\n"
+                f"Read the files. Run the tests. Output ONLY valid JSON — no markdown, no commentary outside JSON.\n"
+                f"If fundamentally wrong: {{\"verdict\": \"RESTART\", \"reason\": \"...\", \"guidance\": \"...\"}}\n"
+                f"If right but incomplete: {{\"verdict\": \"EDIT\", \"feedback\": \"...\", \"demands\": [\"...\"]}}\n"
+                f"If fully complete: {{\"verdict\": \"COMPLETE\", \"critique\": \"...\", \"score\": <1-10>}}"
+            )
+
+            _critic_spin = None
+            try:
+                _face = _random.choice(KawaiiSpinner.KAWAII_WAITING)
+                _critic_spin = KawaiiSpinner(f"{_face} deliver: critic", spinner_type='dots', print_fn=_print_fn)
+                _critic_spin.start()
+                self.agent._delegate_spinner = _critic_spin
+            except Exception:
+                self.agent._delegate_spinner = None
+            try:
+                critic_result = self._deliver_dispatch(
+                    goal=critic_goal,
+                    context="You are a code reviewer. Read the files the worker touched. Run the tests yourself. Form your own verdict from what you see, not what the transcript claims. Output ONLY valid JSON.",
+                    toolsets=["terminal", "file"],
+                    max_iterations=15,
+                )
+            finally:
+                self.agent._delegate_spinner = None
+                if _critic_spin:
+                    try:
+                        _critic_spin.stop("critic done")
+                    except Exception:
+                        pass
+
+            verdict = self._parse_verdict(critic_result)
+            v = verdict.get("verdict", "EDIT").upper()
+            _cprint(f"  Verdict: {v}")
+
+            if v == "COMPLETE":
+                score = verdict.get("score", "?")
+                critique = verdict.get("critique", "")
+                _cprint(f"\n  \u2705 COMPLETE \u2014 score: {score}/10")
+                _cprint(f"  Critique: {critique[:300]}")
+                return
+
+            elif v == "RESTART":
+                previous_output = None
+                feedback = verdict.get("guidance", verdict.get("reason", ""))
+                _cprint(f"  RESTART \u2014 {verdict.get('reason', '')[:100]}")
+            else:  # EDIT
+                previous_output = worker_result
+                feedback = json.dumps(verdict, indent=2)
+                demands = verdict.get("demands", [])
+                _cprint(f"  EDIT \u2014 {len(demands)} demand(s)")
+
+        _cprint(f"\n  \u26a0\ufe0f  Max rounds ({max_rounds}) hit. Spec may need work.")
+
+    # -----------------------------------------------------------------
+    # /fanout — enforced multi-story delivery
+    # -----------------------------------------------------------------
+
+    def _handle_fanout_command(self, cmd: str):
+        """Decompose task into stories, run /deliver per story, serialize state."""
+        from pathlib import Path as _Path
+        import datetime as _dt
+        _dash = "\u2500"
+
+        parts = cmd.strip().split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            _cprint("  Usage: /fanout <task description>")
+            _cprint("  Example: /fanout Build a web scraper with HTTP, parser, rate limiter, storage, CLI")
+            return
+
+        task = parts[1].strip()
+        workdir = _Path(os.getenv("TERMINAL_CWD", os.getcwd()))
+        fanout_dir = workdir / ".fanout"
+        stories_dir = fanout_dir / "stories"
+
+        # --- Resume check ---
+        existing_plan = fanout_dir / "plan.yaml"
+        _resume = False
+        if existing_plan.exists():
+            try:
+                import yaml as _yaml
+                plan_data = _yaml.safe_load(existing_plan.read_text())
+            except ImportError:
+                import re as _re
+                raw = existing_plan.read_text()
+                plan_data = json.loads(raw) if raw.strip().startswith("{") else {"task": task, "stories": [], "completed": []}
+            stored_task = (plan_data.get("task") or "").strip()
+            stored_completed = set(plan_data.get("completed", []))
+            stored_stories = plan_data.get("stories", [])
+            # Task mismatch → stale plan from a prior project; nuke and decompose fresh
+            if stored_task and stored_task != task:
+                _cprint(f"  Found stale .fanout/ (different task) — clearing and re-decomposing")
+                import shutil as _shutil
+                if fanout_dir.exists():
+                    _shutil.rmtree(fanout_dir)
+                existing_plan = fanout_dir / "plan.yaml"
+            elif len(stored_completed) >= len(stored_stories) and stored_stories:
+                # All stories already done — nothing to resume
+                _cprint(f"  Found complete .fanout/ ({len(stored_completed)}/{len(stored_stories)} stories) — clearing for fresh run")
+                import shutil as _shutil
+                if fanout_dir.exists():
+                    _shutil.rmtree(fanout_dir)
+                existing_plan = fanout_dir / "plan.yaml"
+            else:
+                # Incomplete — ask user whether to resume or start fresh
+                _n_done = len(stored_completed)
+                _n_total = len(stored_stories)
+                _remaining = [s.get("name", s.get("id", "?")) for s in stored_stories if s.get("id") not in stored_completed]
+                _cprint(f"  Found incomplete .fanout/ — {_n_done}/{_n_total} stories done")
+                _cprint(f"  Remaining: {', '.join(_remaining)}")
+                _answer = input("  Resume? [Y/n] ").strip().lower()
+                if _answer in ("n", "no"):
+                    _cprint(f"  Clearing and re-decomposing")
+                    import shutil as _shutil
+                    if fanout_dir.exists():
+                        _shutil.rmtree(fanout_dir)
+                    existing_plan = fanout_dir / "plan.yaml"
+                else:
+                    _cprint(f"  Resuming from story {_n_done + 1}")
+                    stories = stored_stories
+                    task = stored_task
+                    _resume = True
+
+        if not _resume:
+            # --- Phase 1: Decompose via delegate_task ---
+            _cprint(f"  🔀 Fanout: decomposing task...")
+            # Lazy-init agent if this is the first command (no prior chat message)
+            if self.agent is None:
+                if not self._init_agent():
+                    _cprint("  ❌ Could not initialize agent — check credentials")
+                    return
+            # Set up spinner for decomposition
+            _decomp_spin = None
+            _print_fn = getattr(self.agent, '_print_fn', None)
+            try:
+                import random as _random
+                from agent.display import KawaiiSpinner
+                _face = _random.choice(KawaiiSpinner.KAWAII_WAITING)
+                _decomp_spin = KawaiiSpinner(f"{_face} fanout: decomposing", spinner_type='dots', print_fn=_print_fn)
+                _decomp_spin.start()
+                self.agent._delegate_spinner = _decomp_spin
+            except Exception:
+                self.agent._delegate_spinner = None
+            try:
+                decomp_result = self._deliver_dispatch(
+                    goal=(
+                        f"Decompose this task into 3-7 ordered stories. Each story must be "
+                        f"narrow enough to complete in one session.\n\n"
+                        f"Output ONLY valid JSON (no markdown):\n"
+                        f'{{"stories": [{{"id": "001", "name": "...", "description": "...", '
+                        f'"dependencies": [], "acceptance": ["criterion 1", "criterion 2"]}}]}}\n\n'
+                        f"TASK:\n{task}"
+                    ),
+                    context="You are a senior architect. Output ONLY valid JSON. No commentary.",
+                    toolsets=["terminal", "file"],
+                    max_iterations=10,
+                )
+            finally:
+                self.agent._delegate_spinner = None
+                if _decomp_spin:
+                    try:
+                        _decomp_spin.stop("decomposition done")
+                    except Exception:
+                        pass
+            try:
+                import re as _re
+                # Check for error string returned by _deliver_dispatch
+                if not decomp_result or not decomp_result.strip():
+                    _cprint("  \u274c Decomposition failed: subagent returned empty response")
+                    _cprint("  The model may have hit a rate limit or timeout. Try again.")
+                    return
+                clean = _re.sub(r'^```(?:json)?\s*', '', decomp_result.strip())
+                clean = _re.sub(r'\s*```\s*$', '', clean)
+                match = _re.search(r'\{.*\}', clean, _re.DOTALL)
+                if not match:
+                    # Likely an error message from _deliver_dispatch, not JSON
+                    _cprint(f"  \u274c Decomposition failed: subagent did not return JSON")
+                    _cprint(f"  Response: {decomp_result[:300]}")
+                    return
+                decomp_data = json.loads(match.group())
+                stories = decomp_data.get("stories", [])
+                if not stories:
+                    _cprint("  \u274c Decomposition produced no stories")
+                    _cprint(f"  Response: {decomp_result[:300]}")
+                    return
+            except (json.JSONDecodeError, AttributeError) as e:
+                _cprint(f"  \u274c Decomposition failed: {e}")
+                _cprint(f"  Raw output: {decomp_result[:300]}")
+                return
+
+            # Persist
+            stories_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                import yaml as _yaml
+                for s in stories:
+                    slug = s.get('name', 'untitled').replace(' ', '-').lower()
+                    story_file = stories_dir / f"{s['id']}-{slug}.yaml"
+                    story_file.write_text(_yaml.dump(s, default_flow_style=False))
+                plan = {"task": task, "stories": stories, "completed": []}
+                existing_plan.write_text(_yaml.dump(plan, default_flow_style=False))
+            except ImportError:
+                # Fallback: JSON persistence
+                for s in stories:
+                    slug = s.get('name', 'untitled').replace(' ', '-').lower()
+                    story_file = stories_dir / f"{s['id']}-{slug}.json"
+                    story_file.write_text(json.dumps(s, indent=2))
+                plan = {"task": task, "stories": stories, "completed": []}
+                existing_plan.write_text(json.dumps(plan, indent=2))
+
+            _cprint(f"  Created {len(stories)} stories in .fanout/")
+
+        # --- Phase 2: Execute stories ---
+        try:
+            import yaml as _yaml
+            plan = _yaml.safe_load(existing_plan.read_text())
+        except ImportError:
+            plan = json.loads(existing_plan.read_text())
+
+        completed = set(plan.get("completed", []))
+        stories = plan.get("stories", [])
+        journal_path = fanout_dir / "journal.md"
+
+        _cprint(f"\n  {'='*50}")
+        _cprint(f"  FANOUT: {len(stories)} stories, {len(completed)} already done")
+        _cprint(f"  {'='*50}")
+
+        for story in stories:
+            sid = story.get("id", "?")
+            sname = story.get("name", "unnamed")
+            deps = story.get("dependencies", [])
+
+            if sid in completed:
+                _cprint(f"\n  Story {sid} ({sname}) \u2014 already complete, skipping")
+                continue
+
+            blocked = [d for d in deps if d not in completed]
+            if blocked:
+                _cprint(f"\n  Story {sid} ({sname}) \u2014 BLOCKED by {blocked}")
+                continue
+
+            _cprint(f"\n  {_dash * 50}")
+            _cprint(f"  STORY {sid}: {sname}")
+            _cprint(f"  {_dash * 50}")
+
+            # Build task from story acceptance criteria
+            acceptance = story.get("acceptance", [])
+            desc = story.get("description", sname)
+            story_task = (
+                f"{desc}\n\n"
+                f"ACCEPTANCE CRITERIA (you must satisfy ALL):\n"
+                + "\n".join(f"  - {a}" for a in acceptance)
+            )
+
+            # Run the enforced deliver loop for this story
+            self._handle_deliver_command(f"/deliver {story_task}")
+
+            # Mark complete
+            completed.add(sid)
+            plan["completed"] = sorted(completed)
+            try:
+                import yaml as _yaml
+                existing_plan.write_text(_yaml.dump(plan, default_flow_style=False))
+            except ImportError:
+                existing_plan.write_text(json.dumps(plan, indent=2))
+
+            # Journal append
+            entry = (
+                f"\n## Story {sid}: {sname} \u2014 COMPLETE\n"
+                f"- Completed at: {_dt.datetime.now().isoformat()}\n"
+                f"- Acceptance: {len(acceptance)} criteria\n"
+            )
+            with open(journal_path, "a") as jf:
+                jf.write(entry)
+
+        _cprint(f"\n  \u2705 Fanout complete: {len(completed)}/{len(stories)} stories done")
+        _cprint(f"  Journal: {journal_path}")
+
     def _handle_background_command(self, cmd: str):
         """Handle /background <prompt> — run a prompt in a separate background session.
 
